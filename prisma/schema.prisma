@@ -1,0 +1,1187 @@
+// PharmaPOS - Prisma schema
+// Fase 01: fondasi database (master data). Model transaksional (stock batch,
+// purchase receipt, POS, shift, transfer, dst) akan ditambahkan pada fase
+// berikutnya sesuai urutan yang disepakati.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enum
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  CENTRAL_ADMIN
+  BRANCH_MANAGER
+  PHARMACIST
+  CASHIER
+  WAREHOUSE_STAFF
+  FINANCE_AUDITOR
+}
+
+/// Status batch stok. Hanya batch AVAILABLE (dan belum lewat ED) yang boleh
+/// dialokasikan ke transaksi keluar normal (lihat services/stock-ledger.ts).
+enum StockBatchStatus {
+  AVAILABLE
+  QUARANTINED
+  BLOCKED
+  EXPIRED
+  DAMAGED
+}
+
+/// Jenis mutasi stok. Setiap StockMovement immutable — koreksi dilakukan
+/// lewat mutasi baru (VOID_REVERSAL, dst), bukan mengedit baris lama.
+enum StockMovementType {
+  OPENING_BALANCE
+  PURCHASE_RECEIPT
+  POS_SALE
+  SALES_RETURN
+  SUPPLIER_RETURN
+  TRANSFER_OUT
+  TRANSFER_IN
+  STOCK_ADJUSTMENT_IN
+  STOCK_ADJUSTMENT_OUT
+  STOCK_OPNAME
+  VOID_REVERSAL
+  EXPIRED_WRITE_OFF
+  DAMAGED_WRITE_OFF
+}
+
+/// Status dokumen stok (Adjustment/Opname). POSTED bersifat immutable —
+/// koreksi lebih lanjut butuh dokumen baru, bukan mengedit dokumen lama.
+enum StockDocumentStatus {
+  DRAFT
+  POSTED
+  CANCELLED
+}
+
+enum AdjustmentDirection {
+  IN
+  OUT
+}
+
+/// Status transfer stok antar-cabang (Fase 08). Alur: cabang TUJUAN
+/// meminta (DRAFT -> REQUESTED), cabang ASAL menyetujui/menolak lalu
+/// mengirim (REQUESTED -> APPROVED/REJECTED -> SHIPPED), cabang TUJUAN
+/// menerima (SHIPPED -> RECEIVED/PARTIALLY_RECEIVED). Lihat
+/// docs/TRANSFER.md untuk state machine & keputusan desain lengkap
+/// (termasuk kenapa tidak ada pembatalan setelah SHIPPED).
+enum StockTransferStatus {
+  DRAFT
+  REQUESTED
+  APPROVED
+  SHIPPED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  REJECTED
+  CANCELLED
+}
+
+/// Status shift kasir. PENDING_APPROVAL adalah transisi sementara sebelum
+/// CLOSED, dipakai hanya bila selisih kas (variance) melebihi threshold
+/// yang dikonfigurasi (lihat AppSetting "CASH_VARIANCE_THRESHOLD") — lihat
+/// docs/POS.md untuk alur lengkap.
+enum CashierShiftStatus {
+  OPEN
+  PENDING_APPROVAL
+  CLOSED
+}
+
+/// Arah mutasi kas manual di dalam shift (di luar penjualan POS itu
+/// sendiri) — dipisah dari AdjustmentDirection (yang khusus stok) karena
+/// domainnya berbeda (kas, bukan kuantitas barang).
+enum CashMovementDirection {
+  IN
+  OUT
+}
+
+/// Status transaksi POS. Fase 06/07 hanya membuat transaksi lewat jalur
+/// atomic "bayar langsung" (langsung berstatus PAID, dengan alokasi FEFO —
+/// lihat docs/POS.md). DRAFT/CANCELLED (disiapkan Fase 06 untuk "tahan
+/// transaksi" sebelum bayar) dan PENDING_PRESCRIPTION_REVIEW/VOIDED/
+/// PARTIALLY_RETURNED/RETURNED (disiapkan Fase 07 untuk resep/void/retur)
+/// adalah nilai enum PLACEHOLDER — belum ada UI/service yang membuat baris
+/// berstatus itu pada fase mana pun sampai saat ini.
+enum PosTransactionStatus {
+  DRAFT
+  PENDING_PRESCRIPTION_REVIEW
+  PAID
+  CANCELLED
+  VOIDED
+  PARTIALLY_RETURNED
+  RETURNED
+}
+
+enum PaymentMethod {
+  CASH
+  QRIS
+  BANK_TRANSFER
+  DEBIT_CARD
+  E_WALLET
+}
+
+/// Status resep (Fase 09). `DRAFT` adalah placeholder — alur yang dipakai
+/// selalu membuat resep langsung `PENDING_REVIEW` begitu kasir mengajukan
+/// (lihat docs/PRESCRIPTION_VOID_RETURN.md). `posTransaction` terkait
+/// berpindah ke `CANCELLED` otomatis saat resep `REJECTED`, atau lanjut
+/// dibayar (→ `PAID`) setelah resep `APPROVED`, yang pada gilirannya
+/// membuat resep ini `COMPLETED`.
+enum PrescriptionStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+/// Kondisi fisik barang yang diretur — menentukan batch tujuan stok
+/// (lihat docs/PRESCRIPTION_VOID_RETURN.md): SELLABLE kembali ke batch
+/// ASAL apa adanya; DAMAGED/QUARANTINE dialihkan ke batch SEGREGASI
+/// terpisah (status batch ikut DAMAGED/QUARANTINED) supaya tidak pernah
+/// diam-diam menambah stok yang bisa dijual.
+enum SalesReturnItemCondition {
+  SELLABLE
+  DAMAGED
+  QUARANTINE
+}
+
+// ---------------------------------------------------------------------------
+// Tenant / organisasi
+// ---------------------------------------------------------------------------
+
+/// Perusahaan (tenant). MVP hanya memakai satu Company, tetapi seluruh model
+/// lain sudah menyimpan companyId agar siap untuk multi-company di masa depan.
+model Company {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branches         Branch[]
+  users            User[]
+  categories       Category[]
+  units            Unit[]
+  products         Product[]
+  suppliers        Supplier[]
+  customers        Customer[]
+  appSettings      AppSetting[]
+  auditLogs        AuditLog[]
+  stockBatches     StockBatch[]
+  stockMovements   StockMovement[]
+  stockAdjustments StockAdjustment[]
+  stockOpnames     StockOpname[]
+  purchaseReceipts PurchaseReceipt[]
+  cashierShifts    CashierShift[]
+  posTransactions  PosTransaction[]
+  stockTransfers   StockTransfer[]
+  prescriptions    Prescription[]
+  salesReturns     SalesReturn[]
+
+  @@index([isActive])
+}
+
+/// Cabang apotek. Semua dokumen operasional pada fase berikutnya wajib
+/// terkait branchId.
+model Branch {
+  id        String   @id @default(cuid())
+  companyId String
+  code      String
+  name      String
+  address   String
+  phone     String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company                     Company                @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  warehouses                  Warehouse[]
+  userAssignments             UserBranchAssignment[]
+  productBranchPrices         ProductBranchPrice[]
+  auditLogs                   AuditLog[]
+  stockBatches                StockBatch[]
+  stockMovements              StockMovement[]
+  stockAdjustments            StockAdjustment[]
+  stockOpnames                StockOpname[]
+  purchaseReceipts            PurchaseReceipt[]
+  cashierShifts               CashierShift[]
+  posTransactions             PosTransaction[]
+  stockTransfersAsSource      StockTransfer[]        @relation("StockTransferSource")
+  stockTransfersAsDestination StockTransfer[]        @relation("StockTransferDestination")
+  prescriptions               Prescription[]
+  salesReturns                SalesReturn[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Lokasi penyimpanan stok di dalam sebuah cabang. MVP hanya memakai satu
+/// warehouse default per cabang, tetapi model sudah mendukung banyak lokasi.
+model Warehouse {
+  id        String   @id @default(cuid())
+  branchId  String
+  code      String
+  name      String
+  isDefault Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  stockBatches   StockBatch[]
+  stockMovements StockMovement[]
+
+  @@unique([branchId, code])
+  @@index([branchId])
+  @@index([isActive])
+}
+
+// ---------------------------------------------------------------------------
+// User & akses cabang
+// ---------------------------------------------------------------------------
+
+/// Akun pengguna. Login memakai email (global unik). Password disimpan
+/// sebagai hash (bcrypt) — tidak pernah plain-text.
+model User {
+  id           String   @id @default(cuid())
+  companyId    String
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company           Company                @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branchAssignments UserBranchAssignment[]
+  auditLogs         AuditLog[]
+
+  stockMovementsCreated   StockMovement[]
+  stockAdjustmentsCreated StockAdjustment[] @relation("StockAdjustmentCreatedBy")
+  stockAdjustmentsPosted  StockAdjustment[] @relation("StockAdjustmentPostedBy")
+  stockOpnamesCreated     StockOpname[]     @relation("StockOpnameCreatedBy")
+  stockOpnamesPosted      StockOpname[]     @relation("StockOpnamePostedBy")
+  purchaseReceiptsCreated PurchaseReceipt[] @relation("PurchaseReceiptCreatedBy")
+  purchaseReceiptsPosted  PurchaseReceipt[] @relation("PurchaseReceiptPostedBy")
+
+  cashierShiftsOwned       CashierShift[]   @relation("CashierShiftUser")
+  cashierShiftsClosed      CashierShift[]   @relation("CashierShiftClosedBy")
+  cashierShiftsApproved    CashierShift[]   @relation("CashierShiftApprovedBy")
+  cashMovementsCreated     CashMovement[]
+  posTransactionsCreated   PosTransaction[] @relation("PosTransactionCreatedBy")
+  posTransactionsCancelled PosTransaction[] @relation("PosTransactionCancelledBy")
+  posTransactionsVoided    PosTransaction[] @relation("PosTransactionVoidedBy")
+
+  stockTransfersCreated   StockTransfer[] @relation("StockTransferCreatedBy")
+  stockTransfersRequested StockTransfer[] @relation("StockTransferRequestedBy")
+  stockTransfersApproved  StockTransfer[] @relation("StockTransferApprovedBy")
+  stockTransfersRejected  StockTransfer[] @relation("StockTransferRejectedBy")
+  stockTransfersShipped   StockTransfer[] @relation("StockTransferShippedBy")
+  stockTransfersReceived  StockTransfer[] @relation("StockTransferReceivedBy")
+  stockTransfersCancelled StockTransfer[] @relation("StockTransferCancelledBy")
+
+  prescriptionsCreated  Prescription[] @relation("PrescriptionCreatedBy")
+  prescriptionsReviewed Prescription[] @relation("PrescriptionReviewedBy")
+  salesReturnsCreated   SalesReturn[]  @relation("SalesReturnCreatedBy")
+
+  @@index([companyId])
+  @@index([role])
+  @@index([isActive])
+}
+
+/// Penugasan user ke cabang. Role lintas-cabang (OWNER, CENTRAL_ADMIN,
+/// FINANCE_AUDITOR) tidak wajib punya baris di sini — akses lintas-cabang
+/// mereka ditentukan oleh Role, bukan oleh assignment (lihat catatan README).
+model UserBranchAssignment {
+  id        String   @id @default(cuid())
+  userId    String
+  branchId  String
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, branchId])
+  @@index([userId])
+  @@index([branchId])
+}
+
+// ---------------------------------------------------------------------------
+// Master data produk
+// ---------------------------------------------------------------------------
+
+model Category {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  products Product[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Satuan (Tablet, Strip, Box, dst). Dipakai sebagai base unit produk maupun
+/// sebagai unit alternatif lewat ProductUnitConversion.
+model Unit {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  symbol    String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company              Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  productsAsBaseUnit   Product[]               @relation("ProductBaseUnit")
+  unitConversions      ProductUnitConversion[]
+  purchaseReceiptItems PurchaseReceiptItem[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Produk adalah master terpusat milik Company (bukan per-cabang). Stok,
+/// harga override, dan transaksi per-cabang mengacu ke Product ini pada
+/// fase berikutnya.
+model Product {
+  id                   String   @id @default(cuid())
+  companyId            String
+  sku                  String
+  name                 String
+  genericName          String?
+  brandName            String?
+  categoryId           String
+  baseUnitId           String
+  defaultSellingPrice  Decimal  @db.Decimal(14, 2)
+  defaultMinStock      Decimal  @db.Decimal(14, 3)
+  requiresPrescription Boolean  @default(false)
+  isControlled         Boolean  @default(false)
+  isActive             Boolean  @default(true)
+  notes                String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  baseUnit Unit     @relation("ProductBaseUnit", fields: [baseUnitId], references: [id], onDelete: Restrict)
+
+  barcodes             ProductBarcode[]
+  unitConversions      ProductUnitConversion[]
+  branchPrices         ProductBranchPrice[]
+  stockBatches         StockBatch[]
+  stockMovements       StockMovement[]
+  purchaseReceiptItems PurchaseReceiptItem[]
+  posTransactionItems  PosTransactionItem[]
+  stockTransferItems   StockTransferItem[]
+
+  @@unique([companyId, sku])
+  @@index([companyId])
+  @@index([categoryId])
+  @@index([baseUnitId])
+  @@index([isActive])
+  @@index([name])
+  @@index([requiresPrescription])
+}
+
+/// Barcode fisik (EAN/UPC/internal) sebuah produk. Dibuat unik secara GLOBAL
+/// (lintas company) karena barcode fisik pada kemasan merepresentasikan satu
+/// identitas produk di dunia nyata — mengunikkannya per-company akan
+/// membuka celah dua produk berbeda terdaftar dengan barcode fisik yang sama,
+/// dan menyulitkan pencarian cepat di POS (scan tanpa perlu tahu company
+/// context terlebih dahulu). Lihat docs/BUSINESS_RULES atau catatan README
+/// untuk detail keputusan ini.
+model ProductBarcode {
+  id        String   @id @default(cuid())
+  productId String
+  barcode   String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+/// Konversi satuan produk relatif terhadap base unit produk tsb.
+/// Contoh: Product "Paracetamol 500mg", baseUnit = Tablet.
+///   - conversion (unit=Strip, factor=10)  -> 1 Strip = 10 Tablet
+///   - conversion (unit=Box,   factor=100) -> 1 Box   = 100 Tablet
+model ProductUnitConversion {
+  id               String   @id @default(cuid())
+  productId        String
+  unitId           String
+  conversionFactor Decimal  @db.Decimal(14, 4)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  unit    Unit    @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, unitId])
+  @@index([productId])
+  @@index([unitId])
+}
+
+/// Harga jual override per cabang. Jika tidak ada baris untuk kombinasi
+/// branchId+productId, gunakan Product.defaultSellingPrice.
+model ProductBranchPrice {
+  id            String    @id @default(cuid())
+  branchId      String
+  productId     String
+  price         Decimal   @db.Decimal(14, 2)
+  /// Opsional. Bila diisi, harga ini secara bisnis baru berlaku mulai
+  /// tanggal ini (mis. promo/kenaikan harga terjadwal). Fase ini hanya
+  /// menyimpan nilainya — penerapan otomatis pada POS ada di fase berikutnya.
+  effectiveDate DateTime?
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, productId])
+  @@index([branchId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Mitra bisnis
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id        String   @id @default(cuid())
+  companyId String
+  code      String?
+  name      String
+  phone     String?
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company          Company           @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  purchaseReceipts PurchaseReceipt[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  companyId String
+  code      String?
+  name      String
+  phone     String?
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+
+  posTransactions PosTransaction[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+// ---------------------------------------------------------------------------
+// Konfigurasi & audit
+// ---------------------------------------------------------------------------
+
+model AppSetting {
+  id        String   @id @default(cuid())
+  companyId String
+  key       String
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, key])
+  @@index([companyId])
+}
+
+/// Log audit append-only. Tidak boleh diedit/dihapus oleh aplikasi.
+model AuditLog {
+  id         String   @id @default(cuid())
+  companyId  String
+  branchId   String?
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  oldValue   Json?
+  newValue   Json?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Inventori: batch, ledger, adjustment, opname (Fase 04)
+// ---------------------------------------------------------------------------
+
+/// Batch stok fisik: satu baris = satu batch/nomor-lot suatu produk di satu
+/// cabang+warehouse. qtyOnHand adalah saldo saat ini (bukan dihitung ulang
+/// dari StockMovement setiap saat) — lihat docs/INVENTORY.md untuk alasan
+/// dan bagaimana konsistensi dijaga terhadap race condition.
+model StockBatch {
+  id           String           @id @default(cuid())
+  companyId    String
+  branchId     String
+  warehouseId  String
+  productId    String
+  batchNumber  String
+  expiryDate   DateTime
+  receivedDate DateTime
+  qtyOnHand    Decimal          @db.Decimal(14, 3)
+  unitCost     Decimal          @db.Decimal(14, 2)
+  status       StockBatchStatus @default(AVAILABLE)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch    Branch    @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  movements                   StockMovement[]
+  adjustmentItems             StockAdjustmentItem[]
+  opnameItems                 StockOpnameItem[]
+  saleAllocations             PosTransactionItemBatchAllocation[]
+  transferItemsAsSource       StockTransferItem[]                 @relation("StockTransferItemSource")
+  transferItemsAsDestination  StockTransferItem[]                 @relation("StockTransferItemDestination")
+  salesReturnDestinationItems SalesReturnItem[]
+
+  @@unique([branchId, productId, batchNumber])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([status])
+  @@index([expiryDate])
+}
+
+/// Ledger mutasi stok — append-only, tidak pernah diedit/dihapus. Setiap
+/// perubahan qtyOnHand StockBatch WAJIB disertai tepat satu baris di sini
+/// dalam transaction yang sama (lihat services/stock-ledger.ts).
+model StockMovement {
+  id            String            @id @default(cuid())
+  companyId     String
+  branchId      String
+  warehouseId   String?
+  productId     String
+  stockBatchId  String
+  movementType  StockMovementType
+  referenceType String
+  referenceId   String
+  qtyIn         Decimal           @db.Decimal(14, 3)
+  qtyOut        Decimal           @db.Decimal(14, 3)
+  balanceAfter  Decimal           @db.Decimal(14, 3)
+  occurredAt    DateTime          @default(now())
+  createdById   String
+  notes         String?
+
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch     Branch     @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  warehouse  Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Restrict)
+  stockBatch StockBatch @relation(fields: [stockBatchId], references: [id], onDelete: Restrict)
+  createdBy  User       @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([productId])
+  @@index([stockBatchId])
+  @@index([movementType])
+  @@index([occurredAt])
+  @@index([referenceType, referenceId])
+}
+
+/// Dokumen koreksi stok manual (mis. barang rusak ditemukan, kesalahan input
+/// sebelumnya). Setiap item mengacu ke StockBatch yang SUDAH ada — adjustment
+/// bukan cara menerima batch baru (itu tugas Purchase Receipt di fase lain).
+model StockAdjustment {
+  id             String              @id @default(cuid())
+  companyId      String
+  branchId       String
+  documentNumber String
+  reason         String
+  status         StockDocumentStatus @default(DRAFT)
+  postedAt       DateTime?
+  postedById     String?
+  createdById    String
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  company   Company               @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch    Branch                @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  createdBy User                  @relation("StockAdjustmentCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  postedBy  User?                 @relation("StockAdjustmentPostedBy", fields: [postedById], references: [id], onDelete: SetNull)
+  items     StockAdjustmentItem[]
+
+  @@unique([companyId, documentNumber])
+  @@index([branchId])
+  @@index([status])
+}
+
+model StockAdjustmentItem {
+  id                String              @id @default(cuid())
+  stockAdjustmentId String
+  stockBatchId      String
+  direction         AdjustmentDirection
+  qty               Decimal             @db.Decimal(14, 3)
+  createdAt         DateTime            @default(now())
+
+  adjustment StockAdjustment @relation(fields: [stockAdjustmentId], references: [id], onDelete: Cascade)
+  batch      StockBatch      @relation(fields: [stockBatchId], references: [id], onDelete: Restrict)
+
+  @@index([stockAdjustmentId])
+  @@index([stockBatchId])
+}
+
+/// Dokumen stock opname (hitung fisik vs sistem). systemQty di-snapshot saat
+/// item dibuat; selisih terhadap countedQty menentukan arah StockMovement
+/// (STOCK_OPNAME) saat posting.
+model StockOpname {
+  id             String              @id @default(cuid())
+  companyId      String
+  branchId       String
+  documentNumber String
+  notes          String?
+  status         StockDocumentStatus @default(DRAFT)
+  postedAt       DateTime?
+  postedById     String?
+  createdById    String
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  company   Company           @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch    Branch            @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  createdBy User              @relation("StockOpnameCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  postedBy  User?             @relation("StockOpnamePostedBy", fields: [postedById], references: [id], onDelete: SetNull)
+  items     StockOpnameItem[]
+
+  @@unique([companyId, documentNumber])
+  @@index([branchId])
+  @@index([status])
+}
+
+model StockOpnameItem {
+  id            String   @id @default(cuid())
+  stockOpnameId String
+  stockBatchId  String
+  systemQty     Decimal  @db.Decimal(14, 3)
+  countedQty    Decimal  @db.Decimal(14, 3)
+  createdAt     DateTime @default(now())
+
+  opname StockOpname @relation(fields: [stockOpnameId], references: [id], onDelete: Cascade)
+  batch  StockBatch  @relation(fields: [stockBatchId], references: [id], onDelete: Restrict)
+
+  @@index([stockOpnameId])
+  @@index([stockBatchId])
+}
+
+// ---------------------------------------------------------------------------
+// Pembelian: penerimaan barang dari supplier (Fase 05)
+// ---------------------------------------------------------------------------
+
+/// Dokumen penerimaan barang dari supplier. Posting membuat/menambah
+/// StockBatch + StockMovement PURCHASE_RECEIPT per item, atomic dalam satu
+/// transaction (lihat services/purchase-receipt-service.ts). POSTED bersifat
+/// immutable — tidak ada edit/hapus; MVP ini juga belum mendukung
+/// pembatalan dokumen yang SUDAH posted (lihat docs/PURCHASING.md).
+model PurchaseReceipt {
+  id                    String              @id @default(cuid())
+  companyId             String
+  branchId              String
+  supplierId            String
+  documentNumber        String
+  supplierInvoiceNumber String
+  supplierInvoiceDate   DateTime
+  receivedDate          DateTime
+  status                StockDocumentStatus @default(DRAFT)
+  notes                 String?
+  createdById           String
+  postedById            String?
+  postedAt              DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  company   Company               @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch    Branch                @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  supplier  Supplier              @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  createdBy User                  @relation("PurchaseReceiptCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  postedBy  User?                 @relation("PurchaseReceiptPostedBy", fields: [postedById], references: [id], onDelete: SetNull)
+  items     PurchaseReceiptItem[]
+
+  @@unique([companyId, documentNumber])
+  @@index([branchId])
+  @@index([supplierId])
+  @@index([status])
+}
+
+/// Satu baris = satu batch yang diterima. qty & unitCost dalam `unitId`
+/// yang DIPILIH SAAT PEMBELIAN (mis. per Box) — dikonversi ke base unit
+/// produk saat posting (lihat services/purchase-receipt-service.ts, yang
+/// juga menerapkan discountAmount sebelum konversi). batchNumber/expiryDate
+/// wajib diisi sebelum posting (divalidasi di service, bukan constraint
+/// NOT NULL, supaya draft tetap bisa disimpan sambil menunggu info lengkap
+/// dari kemasan fisik) — lihat docs/PURCHASING.md untuk kebijakan lengkap.
+model PurchaseReceiptItem {
+  id                String    @id @default(cuid())
+  purchaseReceiptId String
+  productId         String
+  unitId            String
+  qty               Decimal   @db.Decimal(14, 3)
+  unitCost          Decimal   @db.Decimal(14, 2)
+  discountAmount    Decimal   @default(0) @db.Decimal(14, 2)
+  batchNumber       String?
+  expiryDate        DateTime?
+  notes             String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  purchaseReceipt PurchaseReceipt @relation(fields: [purchaseReceiptId], references: [id], onDelete: Cascade)
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  unit            Unit            @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@index([purchaseReceiptId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Kasir: shift & POS dasar (Fase 06)
+// ---------------------------------------------------------------------------
+
+/// Sesi kerja kasir (buka-tutup laci kas) untuk satu user di satu cabang.
+/// "Terminal" pada spesifikasi disederhanakan menjadi cabang saja — MVP ini
+/// belum punya model Terminal fisik terpisah; beberapa kasir boleh punya
+/// shift OPEN bersamaan di cabang yang sama (kasir berbeda), tapi satu USER
+/// hanya boleh punya satu shift OPEN pada satu waktu (lintas cabang mana
+/// pun) — ditegakkan di service DAN lewat partial unique index di database
+/// (lihat migration, tidak dapat diekspresikan lewat DSL Prisma) — lihat
+/// docs/POS.md.
+model CashierShift {
+  id                String             @id @default(cuid())
+  companyId         String
+  branchId          String
+  userId            String
+  status            CashierShiftStatus @default(OPEN)
+  openingCash       Decimal            @db.Decimal(14, 2)
+  openedAt          DateTime           @default(now())
+  closingNotes      String?
+  expectedCash      Decimal?           @db.Decimal(14, 2)
+  actualCash        Decimal?           @db.Decimal(14, 2)
+  variance          Decimal?           @db.Decimal(14, 2)
+  /// Snapshot nilai AppSetting "CASH_VARIANCE_THRESHOLD" pada saat shift
+  /// ditutup — disimpan supaya histori tetap akurat walau threshold
+  /// perusahaan berubah di kemudian hari.
+  varianceThreshold Decimal?           @db.Decimal(14, 2)
+  closedAt          DateTime?
+  closedById        String?
+  approvedAt        DateTime?
+  approvedById      String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  company    Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch     Branch  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  user       User    @relation("CashierShiftUser", fields: [userId], references: [id], onDelete: Restrict)
+  closedBy   User?   @relation("CashierShiftClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  approvedBy User?   @relation("CashierShiftApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+
+  cashMovements   CashMovement[]
+  posTransactions PosTransaction[]
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([userId])
+  @@index([status])
+}
+
+/// Mutasi kas manual di dalam shift (setor/tarik kas di luar transaksi
+/// penjualan), mis. tambahan kembalian atau setoran ke brankas tengah
+/// shift. Selalu butuh alasan — lihat docs/POS.md untuk perhitungan
+/// expectedCash yang memakainya.
+model CashMovement {
+  id             String                @id @default(cuid())
+  cashierShiftId String
+  direction      CashMovementDirection
+  amount         Decimal               @db.Decimal(14, 2)
+  reason         String
+  createdById    String
+  createdAt      DateTime              @default(now())
+
+  shift     CashierShift @relation(fields: [cashierShiftId], references: [id], onDelete: Cascade)
+  createdBy User         @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([cashierShiftId])
+}
+
+/// Transaksi penjualan kasir. Fase 06 HANYA membuat transaksi lewat jalur
+/// atomic "bayar langsung" (header+item+payment dibuat sekaligus berstatus
+/// PAID dalam satu $transaction) — lihat services/pos-transaction-service.ts.
+/// PENTING (lihat docs/POS.md): status PAID pada fase ini adalah dokumen
+/// keuangan yang sudah final (harga, diskon, pembayaran, invoice), TETAPI
+/// belum memotong stok sama sekali (tidak ada StockMovement yang dibuat).
+/// Validasi ketersediaan stok tetap dilakukan (lihat
+/// services/stock-batch-service.ts::getSellableQty), hanya deduksi FINAL +
+/// alokasi FEFO-nya yang ditunda ke Fase 07 — desain ini sengaja dipilih
+/// supaya tidak ada jalur kode yang harus "dibongkar" saat FEFO dibangun.
+model PosTransaction {
+  id             String               @id @default(cuid())
+  companyId      String
+  branchId       String
+  cashierShiftId String
+  customerId     String
+  documentNumber String
+  status         PosTransactionStatus @default(PAID)
+  subtotal       Decimal              @db.Decimal(14, 2)
+  discountAmount Decimal              @default(0) @db.Decimal(14, 2)
+  totalAmount    Decimal              @db.Decimal(14, 2)
+  /// Kembalian tunai (hanya bisa > 0 bila ada pembayaran CASH yang
+  /// di-tender lebih dari sisa tagihan — lihat services/pos-payment-calc.ts).
+  changeAmount   Decimal              @default(0) @db.Decimal(14, 2)
+  notes          String?
+  createdById    String
+  /// Nullable (Fase 09): transaksi jalur resep dibuat dulu berstatus
+  /// PENDING_PRESCRIPTION_REVIEW TANPA pembayaran — paidAt baru diisi saat
+  /// benar-benar dibayar (createPaidTransaction langsung, atau
+  /// finalizePrescriptionPayment setelah resep disetujui).
+  paidAt         DateTime?
+  cancelledAt    DateTime?
+  cancelledById  String?
+  cancelReason   String?
+  /// Void (Fase 09) — TERPISAH dari cancelledAt/cancelledById/cancelReason
+  /// di atas (yang khusus pembatalan PRA-bayar): void membalikkan transaksi
+  /// yang SUDAH PAID, semantiknya beda dan riwayatnya harus jelas beda.
+  voidedAt       DateTime?
+  voidedById     String?
+  voidReason     String?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  company     Company      @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch      Branch       @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  shift       CashierShift @relation(fields: [cashierShiftId], references: [id], onDelete: Restrict)
+  customer    Customer     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  createdBy   User         @relation("PosTransactionCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  cancelledBy User?        @relation("PosTransactionCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+  voidedBy    User?        @relation("PosTransactionVoidedBy", fields: [voidedById], references: [id], onDelete: SetNull)
+
+  items        PosTransactionItem[]
+  payments     Payment[]
+  prescription Prescription?
+  salesReturns SalesReturn[]
+
+  @@unique([companyId, documentNumber])
+  @@index([branchId])
+  @@index([cashierShiftId])
+  @@index([customerId])
+  @@index([status])
+}
+
+/// Satu baris item terjual. `unitPrice` adalah SNAPSHOT harga jual pada
+/// saat transaksi dibuat (base unit produk — Fase 06 belum mendukung
+/// pemilihan satuan jual seperti Strip/Box, lihat docs/POS.md), bukan
+/// referensi hidup ke Product/ProductBranchPrice, supaya histori transaksi
+/// tidak berubah walau harga produk berubah di kemudian hari.
+model PosTransactionItem {
+  id               String   @id @default(cuid())
+  posTransactionId String
+  productId        String
+  qty              Decimal  @db.Decimal(14, 3)
+  unitPrice        Decimal  @db.Decimal(14, 2)
+  discountAmount   Decimal  @default(0) @db.Decimal(14, 2)
+  lineTotal        Decimal  @db.Decimal(14, 2)
+  notes            String?
+  createdAt        DateTime @default(now())
+
+  transaction      PosTransaction                      @relation(fields: [posTransactionId], references: [id], onDelete: Cascade)
+  product          Product                             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  allocations      PosTransactionItemBatchAllocation[]
+  salesReturnItems SalesReturnItem[]
+
+  @@index([posTransactionId])
+  @@index([productId])
+}
+
+/// Satu baris pembayaran (mendukung split payment lintas metode). Lihat
+/// services/pos-payment-calc.ts untuk aturan validasi jumlah & perhitungan
+/// kembalian.
+model Payment {
+  id               String        @id @default(cuid())
+  posTransactionId String
+  method           PaymentMethod
+  amount           Decimal       @db.Decimal(14, 2)
+  reference        String?
+  /// Penanda reversal (Fase 09, void) — baris Payment ASLI tidak pernah
+  /// dihapus/diedit nilainya (fakta finansial historis), hanya ditandai
+  /// sudah dibalik saat transaksi induknya di-void.
+  isReversed       Boolean       @default(false)
+  createdAt        DateTime      @default(now())
+
+  transaction PosTransaction @relation(fields: [posTransactionId], references: [id], onDelete: Cascade)
+
+  @@index([posTransactionId])
+}
+
+/// Alokasi batch keluar untuk satu PosTransactionItem (Fase 07) — traceability
+/// wajib untuk audit/recall. Satu item boleh punya banyak baris di sini bila
+/// alokasi FEFO terpecah lintas beberapa batch (qty item melebihi qty satu
+/// batch). batchNumberSnapshot/expiryDateSnapshot/unitCostSnapshot disimpan
+/// sebagai SALINAN nilai batch pada saat penjualan (bukan hanya FK hidup ke
+/// StockBatch) — histori penjualan/recall tetap akurat walau batch tsb nanti
+/// diedit/diberi status lain. Dibuat SELALU dalam transaction yang sama
+/// dengan deductStockFromBatch (lihat services/pos-transaction-service.ts)
+/// sehingga satu StockMovement POS_SALE selalu berpasangan tepat dengan satu
+/// baris di sini.
+model PosTransactionItemBatchAllocation {
+  id                   String   @id @default(cuid())
+  posTransactionItemId String
+  stockBatchId         String
+  batchNumberSnapshot  String
+  expiryDateSnapshot   DateTime
+  qtyOut               Decimal  @db.Decimal(14, 3)
+  unitCostSnapshot     Decimal  @db.Decimal(14, 2)
+  createdAt            DateTime @default(now())
+
+  item        PosTransactionItem @relation(fields: [posTransactionItemId], references: [id], onDelete: Cascade)
+  stockBatch  StockBatch         @relation(fields: [stockBatchId], references: [id], onDelete: Restrict)
+  returnItems SalesReturnItem[]
+
+  @@index([posTransactionItemId])
+  @@index([stockBatchId])
+}
+
+// ---------------------------------------------------------------------------
+// Transfer stok antar-cabang (Fase 08)
+// ---------------------------------------------------------------------------
+
+/// Dokumen transfer stok antar-cabang. Cabang TUJUAN membuat & meminta
+/// (DRAFT -> REQUESTED); cabang ASAL menyetujui/menolak lalu mengirim
+/// (REQUESTED -> APPROVED/REJECTED -> SHIPPED); cabang TUJUAN menerima
+/// (SHIPPED -> RECEIVED/PARTIALLY_RECEIVED) — lihat docs/TRANSFER.md.
+/// SENGAJA tidak ada pembatalan setelah SHIPPED: stok sudah berpindah
+/// fisik dari cabang asal (StockMovement TRANSFER_OUT sudah tercatat),
+/// dan MVP ini belum membangun alur retur/reversal penuh.
+model StockTransfer {
+  id                  String              @id @default(cuid())
+  companyId           String
+  sourceBranchId      String
+  destinationBranchId String
+  documentNumber      String
+  status              StockTransferStatus @default(DRAFT)
+  notes               String?
+
+  requestedById   String?
+  requestedAt     DateTime?
+  approvedById    String?
+  approvedAt      DateTime?
+  rejectedById    String?
+  rejectedAt      DateTime?
+  rejectionReason String?
+  shippedById     String?
+  shippedAt       DateTime?
+  receivedById    String?
+  receivedAt      DateTime?
+  cancelledById   String?
+  cancelledAt     DateTime?
+
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  company           Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  sourceBranch      Branch  @relation("StockTransferSource", fields: [sourceBranchId], references: [id], onDelete: Restrict)
+  destinationBranch Branch  @relation("StockTransferDestination", fields: [destinationBranchId], references: [id], onDelete: Restrict)
+  createdBy         User    @relation("StockTransferCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  requestedBy       User?   @relation("StockTransferRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  approvedBy        User?   @relation("StockTransferApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  rejectedBy        User?   @relation("StockTransferRejectedBy", fields: [rejectedById], references: [id], onDelete: SetNull)
+  shippedBy         User?   @relation("StockTransferShippedBy", fields: [shippedById], references: [id], onDelete: SetNull)
+  receivedBy        User?   @relation("StockTransferReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+  cancelledBy       User?   @relation("StockTransferCancelledBy", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  items StockTransferItem[]
+
+  @@unique([companyId, documentNumber])
+  @@index([sourceBranchId])
+  @@index([destinationBranchId])
+  @@index([status])
+}
+
+/// Satu baris produk yang ditransfer. sourceBatchNumberSnapshot/
+/// expiryDateSnapshot/unitCostSnapshot diambil dari sourceStockBatch SAAT
+/// ITEM DIBUAT (nilai-nilai ini permanen sekali batch dibuat — sama
+/// seperti alasan PosTransactionItem.unitPrice snapshot di Fase 06/07),
+/// lalu dipakai APA ADANYA saat receive untuk membuat/menambah batch
+/// tujuan lewat receiveStockToBatch — inilah mekanisme genealogy:
+/// sourceStockBatchId + destinationStockBatchId bersama-sama membentuk
+/// jejak "batch tujuan X berasal dari batch asal Y".
+///
+/// qtyRequested diisi saat draft dibuat; qtyShipped diisi saat SHIP
+/// (boleh kurang dari qtyRequested); qtyReceived diisi saat RECEIVE
+/// (boleh kurang dari qtyShipped — discrepancyReason WAJIB bila begitu).
+model StockTransferItem {
+  id         String @id @default(cuid())
+  transferId String
+  productId  String
+
+  sourceStockBatchId        String
+  sourceBatchNumberSnapshot String
+  expiryDateSnapshot        DateTime
+  unitCostSnapshot          Decimal  @db.Decimal(14, 2)
+
+  qtyRequested Decimal  @db.Decimal(14, 3)
+  qtyShipped   Decimal? @db.Decimal(14, 3)
+  qtyReceived  Decimal? @db.Decimal(14, 3)
+
+  destinationStockBatchId String?
+  discrepancyReason       String?
+  notes                   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transfer              StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  product               Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+  sourceStockBatch      StockBatch    @relation("StockTransferItemSource", fields: [sourceStockBatchId], references: [id], onDelete: Restrict)
+  destinationStockBatch StockBatch?   @relation("StockTransferItemDestination", fields: [destinationStockBatchId], references: [id], onDelete: SetNull)
+
+  @@index([transferId])
+  @@index([productId])
+  @@index([sourceStockBatchId])
+  @@index([destinationStockBatchId])
+}
+
+// ---------------------------------------------------------------------------
+// Resep minimum (Fase 09)
+// ---------------------------------------------------------------------------
+
+/// Data resep minimum untuk transaksi POS yang mengandung produk
+/// `requiresPrescription`. Level-transaksi (bukan per-item) — seluruh
+/// keranjang gagal/lolos review sebagai satu unit, lihat
+/// docs/PRESCRIPTION_VOID_RETURN.md untuk alur dua tahap lengkap
+/// (createPendingPrescriptionTransaction -> review -> finalizePrescriptionPayment).
+/// `pharmacistNotes` dipakai ganda: diisi kasir saat mengajukan (opsional)
+/// dan DITIMPA/ditambah reviewer saat approve/reject (wajib diisi saat
+/// reject sebagai alasan penolakan).
+model Prescription {
+  id                 String             @id @default(cuid())
+  companyId          String
+  branchId           String
+  posTransactionId   String             @unique
+  patientName        String
+  patientPhone       String?
+  doctorName         String
+  prescriptionNumber String
+  prescriptionDate   DateTime
+  imagePath          String?
+  pharmacistNotes    String?
+  status             PrescriptionStatus @default(PENDING_REVIEW)
+  reviewedById       String?
+  reviewedAt         DateTime?
+  createdById        String
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  company        Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch         Branch         @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  posTransaction PosTransaction @relation(fields: [posTransactionId], references: [id], onDelete: Restrict)
+  createdBy      User           @relation("PrescriptionCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  reviewedBy     User?          @relation("PrescriptionReviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Retur penjualan (Fase 09)
+// ---------------------------------------------------------------------------
+
+/// Dokumen retur penjualan — satu aksi atomic (tidak ada alur draft/approve
+/// terpisah, mirror gaya "one-shot" `receiveTransfer` Fase 08). Wajib
+/// mereferensikan invoice (`PosTransaction`) asal & alasan retur. Lihat
+/// docs/PRESCRIPTION_VOID_RETURN.md untuk aturan kondisi barang &
+/// penanganan stok DAMAGED/QUARANTINE.
+model SalesReturn {
+  id               String   @id @default(cuid())
+  companyId        String
+  branchId         String
+  posTransactionId String
+  reason           String
+  createdById      String
+  createdAt        DateTime @default(now())
+
+  company        Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  branch         Branch         @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  posTransaction PosTransaction @relation(fields: [posTransactionId], references: [id], onDelete: Restrict)
+  createdBy      User           @relation("SalesReturnCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  items SalesReturnItem[]
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([posTransactionId])
+}
+
+/// Satu baris retur = satu `PosTransactionItemBatchAllocation` ASAL yang
+/// terpengaruh (bukan hanya `PosTransactionItem` — item yang dulu
+/// dialokasikan FEFO ke >1 batch bisa menghasilkan >1 baris retur di sini,
+/// masing-masing mengacu ke alokasi asalnya sendiri). `destinationStockBatchId`
+/// = batch ASAL apa adanya bila `condition=SELLABLE`, atau batch SEGREGASI
+/// terpisah (status DAMAGED/QUARANTINED) bila tidak — lihat
+/// services/sales-return-service.ts & docs/PRESCRIPTION_VOID_RETURN.md.
+model SalesReturnItem {
+  id                      String                   @id @default(cuid())
+  salesReturnId           String
+  posTransactionItemId    String
+  sourceAllocationId      String
+  qtyReturned             Decimal                  @db.Decimal(14, 3)
+  condition               SalesReturnItemCondition
+  destinationStockBatchId String
+  createdAt               DateTime                 @default(now())
+
+  salesReturn           SalesReturn                       @relation(fields: [salesReturnId], references: [id], onDelete: Cascade)
+  posTransactionItem    PosTransactionItem                @relation(fields: [posTransactionItemId], references: [id], onDelete: Restrict)
+  sourceAllocation      PosTransactionItemBatchAllocation @relation(fields: [sourceAllocationId], references: [id], onDelete: Restrict)
+  destinationStockBatch StockBatch                        @relation(fields: [destinationStockBatchId], references: [id], onDelete: Restrict)
+
+  @@index([salesReturnId])
+  @@index([posTransactionItemId])
+  @@index([sourceAllocationId])
+}

@@ -1,0 +1,320 @@
+%% PharmaPOS — ERD Model Inti (Fase 11)
+%% Sumber kebenaran tetap prisma/schema.prisma — diagram ini ringkasan
+%% relasi & field kunci untuk onboarding, BUKAN dump kolom lengkap.
+%% Lihat docs/BUSINESS_RULES.md untuk aturan bisnis di balik relasi ini.
+
+erDiagram
+    COMPANY ||--o{ BRANCH : has
+    COMPANY ||--o{ USER : employs
+    COMPANY ||--o{ PRODUCT : owns
+    COMPANY ||--o{ CATEGORY : owns
+    COMPANY ||--o{ UNIT : owns
+    COMPANY ||--o{ SUPPLIER : owns
+    COMPANY ||--o{ CUSTOMER : owns
+    COMPANY ||--o{ APP_SETTING : configures
+
+    BRANCH ||--o{ WAREHOUSE : has
+    BRANCH ||--o{ USER_BRANCH_ASSIGNMENT : "assigned via"
+    USER ||--o{ USER_BRANCH_ASSIGNMENT : "assigned via"
+
+    PRODUCT }o--|| CATEGORY : belongs_to
+    PRODUCT }o--|| UNIT : "base unit"
+    PRODUCT ||--o{ PRODUCT_BARCODE : has
+    PRODUCT ||--o{ PRODUCT_UNIT_CONVERSION : has
+    PRODUCT ||--o{ PRODUCT_BRANCH_PRICE : "override price per"
+    BRANCH ||--o{ PRODUCT_BRANCH_PRICE : "override price at"
+
+    %% --- Inventori inti (Fase 04) ---
+    BRANCH ||--o{ STOCK_BATCH : holds
+    WAREHOUSE ||--o{ STOCK_BATCH : stores
+    PRODUCT ||--o{ STOCK_BATCH : "instance of"
+    STOCK_BATCH ||--o{ STOCK_MOVEMENT : "ledger of"
+    STOCK_BATCH ||--o{ STOCK_ADJUSTMENT_ITEM : referenced_by
+    STOCK_BATCH ||--o{ STOCK_OPNAME_ITEM : referenced_by
+    BRANCH ||--o{ STOCK_ADJUSTMENT : at
+    BRANCH ||--o{ STOCK_OPNAME : at
+    STOCK_ADJUSTMENT ||--o{ STOCK_ADJUSTMENT_ITEM : contains
+    STOCK_OPNAME ||--o{ STOCK_OPNAME_ITEM : contains
+
+    %% --- Purchasing (Fase 05) ---
+    SUPPLIER ||--o{ PURCHASE_RECEIPT : "sold to"
+    BRANCH ||--o{ PURCHASE_RECEIPT : receives_at
+    PURCHASE_RECEIPT ||--o{ PURCHASE_RECEIPT_ITEM : contains
+    PRODUCT ||--o{ PURCHASE_RECEIPT_ITEM : "received as"
+    UNIT ||--o{ PURCHASE_RECEIPT_ITEM : "purchased in"
+
+    %% --- Cashier shift & POS (Fase 06/07) ---
+    BRANCH ||--o{ CASHIER_SHIFT : opens_at
+    USER ||--o{ CASHIER_SHIFT : operates
+    CASHIER_SHIFT ||--o{ CASH_MOVEMENT : has
+    CASHIER_SHIFT ||--o{ POS_TRANSACTION : contains
+    CUSTOMER ||--o{ POS_TRANSACTION : "purchased by"
+    BRANCH ||--o{ POS_TRANSACTION : at
+    POS_TRANSACTION ||--o{ POS_TRANSACTION_ITEM : contains
+    POS_TRANSACTION ||--o{ PAYMENT : "paid via"
+    PRODUCT ||--o{ POS_TRANSACTION_ITEM : sold
+    POS_TRANSACTION_ITEM ||--o{ POS_TRANSACTION_ITEM_BATCH_ALLOCATION : "fulfilled from (FEFO)"
+    STOCK_BATCH ||--o{ POS_TRANSACTION_ITEM_BATCH_ALLOCATION : allocated_out
+
+    %% --- Transfer antar-cabang (Fase 08) ---
+    BRANCH ||--o{ STOCK_TRANSFER : "source of"
+    BRANCH ||--o{ STOCK_TRANSFER : "destination of"
+    STOCK_TRANSFER ||--o{ STOCK_TRANSFER_ITEM : contains
+    PRODUCT ||--o{ STOCK_TRANSFER_ITEM : transferred
+    STOCK_BATCH ||--o{ STOCK_TRANSFER_ITEM : "shipped from"
+
+    %% --- Resep, Void, Retur (Fase 09) ---
+    POS_TRANSACTION ||--o| PRESCRIPTION : "requires (1:1, optional)"
+    POS_TRANSACTION ||--o{ SALES_RETURN : "returned via"
+    SALES_RETURN ||--o{ SALES_RETURN_ITEM : contains
+    POS_TRANSACTION_ITEM ||--o{ SALES_RETURN_ITEM : "returned from"
+    POS_TRANSACTION_ITEM_BATCH_ALLOCATION ||--o{ SALES_RETURN_ITEM : "returned to (source)"
+    STOCK_BATCH ||--o{ SALES_RETURN_ITEM : "returned into (destination)"
+
+    %% --- Audit (lintas semua modul, entityType/entityId generik) ---
+    COMPANY ||--o{ AUDIT_LOG : logs
+
+    COMPANY {
+        string id PK
+        string name
+    }
+    BRANCH {
+        string id PK
+        string companyId FK
+        string code
+        string name
+        boolean isActive
+    }
+    WAREHOUSE {
+        string id PK
+        string branchId FK
+        string code
+        boolean isDefault
+    }
+    USER {
+        string id PK
+        string companyId FK
+        string email
+        string passwordHash "never selected outside auth"
+        enum role "OWNER/CENTRAL_ADMIN/BRANCH_MANAGER/PHARMACIST/CASHIER/WAREHOUSE_STAFF/FINANCE_AUDITOR"
+        boolean isActive
+    }
+    USER_BRANCH_ASSIGNMENT {
+        string userId FK
+        string branchId FK
+    }
+    CATEGORY {
+        string id PK
+        string companyId FK
+        string name
+    }
+    UNIT {
+        string id PK
+        string companyId FK
+        string name
+        string symbol
+    }
+    PRODUCT {
+        string id PK
+        string companyId FK
+        string categoryId FK
+        string baseUnitId FK
+        string sku
+        string name
+        boolean requiresPrescription
+        decimal defaultMinStock
+        decimal defaultSellingPrice
+    }
+    PRODUCT_BARCODE {
+        string id PK
+        string productId FK
+        string barcode "unique GLOBAL, not per-company"
+    }
+    PRODUCT_UNIT_CONVERSION {
+        string productId FK
+        string unitId FK
+        decimal conversionFactor "relative to base unit"
+    }
+    PRODUCT_BRANCH_PRICE {
+        string id PK
+        string productId FK
+        string branchId FK
+        decimal price
+        boolean isActive
+    }
+    SUPPLIER {
+        string id PK
+        string companyId FK
+        string name
+    }
+    CUSTOMER {
+        string id PK
+        string companyId FK
+        string code "UMUM = default"
+        string name
+    }
+    APP_SETTING {
+        string id PK
+        string companyId FK
+        string key "e.g. CASH_VARIANCE_THRESHOLD, NEAR_EXPIRY_WINDOW_DAYS"
+        json value
+    }
+    STOCK_BATCH {
+        string id PK
+        string companyId FK
+        string branchId FK
+        string warehouseId FK
+        string productId FK
+        string batchNumber
+        date expiryDate
+        decimal qtyOnHand "never negative — CAS update only"
+        enum status "AVAILABLE/QUARANTINED/BLOCKED/EXPIRED/DAMAGED"
+    }
+    STOCK_MOVEMENT {
+        string id PK
+        string stockBatchId FK
+        enum movementType "13 values, append-only ledger"
+        decimal qtyIn
+        decimal qtyOut
+        decimal balanceAfter
+        string referenceType
+        string referenceId
+    }
+    STOCK_ADJUSTMENT {
+        string id PK
+        string branchId FK
+        string documentNumber "ADJ-000001"
+        enum status "DRAFT/POSTED/CANCELLED"
+    }
+    STOCK_ADJUSTMENT_ITEM {
+        string id PK
+        string stockAdjustmentId FK
+        string stockBatchId FK
+        enum direction "IN/OUT"
+        decimal qty
+    }
+    STOCK_OPNAME {
+        string id PK
+        string branchId FK
+        string documentNumber "OPN-000001"
+        enum status
+    }
+    STOCK_OPNAME_ITEM {
+        string id PK
+        string stockOpnameId FK
+        string stockBatchId FK
+        decimal systemQty "snapshot at create time"
+        decimal countedQty
+    }
+    PURCHASE_RECEIPT {
+        string id PK
+        string branchId FK
+        string supplierId FK
+        string documentNumber "PR-000001"
+        enum status
+    }
+    PURCHASE_RECEIPT_ITEM {
+        string id PK
+        string purchaseReceiptId FK
+        string productId FK
+        string unitId FK
+        decimal qty
+        string batchNumber
+        date expiryDate
+    }
+    CASHIER_SHIFT {
+        string id PK
+        string branchId FK
+        string userId FK
+        enum status "OPEN/PENDING_APPROVAL/CLOSED"
+        decimal openingCash
+        decimal expectedCash
+        decimal actualCash
+        decimal variance
+    }
+    CASH_MOVEMENT {
+        string id PK
+        string cashierShiftId FK
+        enum direction "IN/OUT"
+        decimal amount
+    }
+    POS_TRANSACTION {
+        string id PK
+        string branchId FK
+        string cashierShiftId FK
+        string customerId FK
+        string documentNumber "INV-000001"
+        enum status "DRAFT/PENDING_PRESCRIPTION_REVIEW/PAID/CANCELLED/VOIDED/PARTIALLY_RETURNED/RETURNED"
+        decimal totalAmount
+        datetime paidAt "nullable"
+        datetime voidedAt "nullable"
+    }
+    POS_TRANSACTION_ITEM {
+        string id PK
+        string posTransactionId FK
+        string productId FK
+        decimal qty
+        decimal unitPrice "price snapshot"
+    }
+    PAYMENT {
+        string id PK
+        string posTransactionId FK
+        enum method "CASH/QRIS/BANK_TRANSFER/DEBIT_CARD/E_WALLET"
+        decimal amount
+        boolean isReversed "set true on void"
+    }
+    POS_TRANSACTION_ITEM_BATCH_ALLOCATION {
+        string id PK
+        string posTransactionItemId FK
+        string stockBatchId FK
+        decimal qtyOut
+        string batchNumberSnapshot
+    }
+    STOCK_TRANSFER {
+        string id PK
+        string sourceBranchId FK
+        string destinationBranchId FK
+        string documentNumber "TRF-000001"
+        enum status "DRAFT/REQUESTED/APPROVED/SHIPPED/PARTIALLY_RECEIVED/RECEIVED/REJECTED/CANCELLED"
+    }
+    STOCK_TRANSFER_ITEM {
+        string id PK
+        string transferId FK
+        string productId FK
+        string sourceStockBatchId FK
+        decimal qtyRequested
+        decimal qtyShipped
+        decimal qtyReceived
+    }
+    PRESCRIPTION {
+        string id PK
+        string posTransactionId FK "unique — 1:1"
+        string patientName
+        string doctorName
+        enum status "PENDING_REVIEW/APPROVED/REJECTED/COMPLETED"
+        string reviewedById FK
+    }
+    SALES_RETURN {
+        string id PK
+        string posTransactionId FK
+        string reason
+    }
+    SALES_RETURN_ITEM {
+        string id PK
+        string salesReturnId FK
+        string posTransactionItemId FK
+        string sourceAllocationId FK
+        string destinationStockBatchId FK
+        decimal qtyReturned
+        enum condition "SELLABLE/DAMAGED/QUARANTINE"
+    }
+    AUDIT_LOG {
+        string id PK
+        string companyId FK
+        string actorId FK
+        string action
+        string entityType
+        string entityId
+        json oldValue
+        json newValue
+    }
